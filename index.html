@@ -2,11 +2,10 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<link rel="manifest" href="manifest.json">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="manifest" href="manifest.json">
 
     <title>tap 2 start</title>
     <style>
@@ -73,6 +72,27 @@ let bestScoreAlpha = 0;
 let spinSpeed = 0;
 let scorePopScale = 1;
 
+// [추가] HOW TO PLAY 버튼 애니메이션 오프셋
+let howToPlayYOffset = 0;
+
+// [버그 수정 #2] 절전모드 등으로 프레임 간격이 길어져도 속도가 느려지지 않도록
+// 매 프레임 보정해주는 시간 스케일 값 (1.0 = 이상적인 60fps 기준 한 프레임)
+let dt = 1;
+
+// [신규 #4] 메인 화면 하단 "HOW TO PLAY" 버튼 + 튜토리얼 진행 상태
+let tutorialStep = 0;          // 0: 채워진 막대 설명, 1: 빈 막대 설명, 2: 연습, 3: 완료
+let tutorialPracticeHits = 0;
+const TUTORIAL_PRACTICE_TARGET = 3;
+let tutorialFeedbackText = '';
+let tutorialFeedbackAlpha = 0;
+
+// [버그 수정 #1] Android 등에서 touchstart 이후 합성(ghost) mousedown이 한 번 더 발생해
+// 한 번의 탭이 두 번 처리되거나 "누른 상태에 갇히는" 현상을 막기 위한 디바운스 타임스탬프
+let lastInputTime = -1000;
+const INPUT_DEBOUNCE_MS = 80;
+
+const BEST_SCORE_STORAGE_KEY = 'tap2start_bestScore'; // [신규 #3] 로컬 최고기록 저장 키
+
 let audioCtx;
 function playTone(freq,duration){
  if(!audioCtx) audioCtx=new(window.AudioContext||window.webkitAudioContext)();
@@ -98,7 +118,6 @@ function failFx(){
  if(navigator.vibrate) navigator.vibrate([35,50,35,50,60]);
 }
 
-
 function setup() {
     createCanvas(windowWidth, windowHeight);
     
@@ -113,11 +132,57 @@ function setup() {
     
     textFont('Google Sans');
 
+    // [신규 #3] 로컬에 저장된 최고 기록 불러오기 (프라이빗 모드 등에서 실패해도 게임은 계속 진행)
+    try {
+        let saved = localStorage.getItem(BEST_SCORE_STORAGE_KEY);
+        if (saved !== null) bestScore = parseInt(saved, 10) || 0;
+    } catch (e) {
+        console.warn('localStorage를 사용할 수 없어 최고 기록을 불러오지 못했습니다.', e);
+    }
+
     checkSupport();
     if (isSupported) {
         initElements();
         resetGame();
     }
+
+    bindInputEvents(); // [버그 수정 #1] p5 기본 mousePressed 대신 전용 입력 핸들러 사용
+}
+
+// [버그 수정 #1] Android 일부 브라우저에서 touchstart 직후 합성된 mousedown이 또 발생해
+// 하나의 탭이 두 번 처리되거나, 내부적으로 "누른 상태"에 갇혀서 다음 탭이 무시되는 현상이 있었음.
+// p5의 자동 mousePressed 콜백(내부적으로 눌림 상태를 추적함) 대신, 캔버스에 직접
+// touchstart/mousedown 리스너를 달아 매번 "새로운 탭"으로 독립적으로 처리하고,
+// 항상 preventDefault로 합성 이벤트 자체를 차단 + 짧은 디바운스로 중복 입력을 무시한다.
+function bindInputEvents() {
+    let canvasElt = document.querySelector('canvas');
+    if (!canvasElt) return;
+
+    canvasElt.addEventListener('touchstart', function (e) {
+        e.preventDefault();
+        let t = e.changedTouches && e.changedTouches[0];
+        if (t) handleRawTap(t.clientX, t.clientY);
+    }, { passive: false });
+
+    canvasElt.addEventListener('mousedown', function (e) {
+        e.preventDefault();
+        handleRawTap(e.clientX, e.clientY);
+    });
+
+    // 길게 누르기로 컨텍스트 메뉴/텍스트 선택 등이 뜨면서 입력이 꼬이는 것을 방지
+    canvasElt.addEventListener('touchend', function (e) { e.preventDefault(); }, { passive: false });
+    canvasElt.addEventListener('touchcancel', function (e) { e.preventDefault(); }, { passive: false });
+    canvasElt.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+}
+
+function handleRawTap(clientX, clientY) {
+    let now = (window.performance ? performance.now() : Date.now());
+    if (now - lastInputTime < INPUT_DEBOUNCE_MS) return; // 동일 탭에서 발생한 중복 이벤트 무시
+    lastInputTime = now;
+
+    let canvasElt = document.querySelector('canvas');
+    let rect = canvasElt ? canvasElt.getBoundingClientRect() : { left: 0, top: 0 };
+    onTap(clientX - rect.left, clientY - rect.top);
 }
 
 function windowResized() {
@@ -153,6 +218,17 @@ function getEasing(x, x1, y1, x2, y2) {
         t = (upper + lower) / 2;
     }
     return bezierPoint(0, y1, y2, 1, t);
+}
+
+// [버그 수정 #2] 보간 계수를 프레임 시간(dt)에 맞게 보정.
+// 절전모드 등으로 프레임이 평소보다 늦게 와도(=dt가 커짐) 같은 "실제 시간" 동안
+// 같은 비율만큼 움직이도록 만들어 체감 속도가 느려지지 않게 한다.
+function lerpDT(current, target, amt) {
+    return lerp(current, target, 1 - Math.pow(1 - amt, dt));
+}
+
+function lerpColorDT(c1, c2, amt) {
+    return lerpColor(c1, c2, 1 - Math.pow(1 - amt, dt));
 }
 
 function initElements() {
@@ -197,7 +273,7 @@ function resetGame() {
     spinSpeed = 0;
     scorePopScale = 1;
 
-    // 카메라를 원점(중앙 / 줌1 / 기울기0)으로 초기화
+    // 카메라는 항상 원점(중앙 / 줌1 / 기울기0) 고정
     camX = W / 2;
     camY = H / 2;
     camZoom = 1;
@@ -214,10 +290,15 @@ function resetGame() {
     
     bar1.cleared = true;
 
-    // [신규] 막대 팝 이펙트 상태 초기화
+    // 막대 팝 이펙트 상태 초기화
     bar1.popScale = 1;
     bar2.popScale = 1;
     
+    // 튜토리얼 오버레이도 함께 초기화
+    tutorialStep = 0;
+    tutorialPracticeHits = 0;
+    tutorialFeedbackAlpha = 0;
+
     boxX = bar1.x;
     updateBoxY();
     boxAngle = 0;
@@ -225,7 +306,13 @@ function resetGame() {
 
 function triggerGameOver() {
     failFx();
-bestScore = max(bestScore, score);
+    bestScore = max(bestScore, score);
+    // [신규 #3] 최고 기록을 로컬에 저장해서 다음에 다시 들어와도 유지되게 함
+    try {
+        localStorage.setItem(BEST_SCORE_STORAGE_KEY, String(bestScore));
+    } catch (e) {
+        // 프라이빗 모드 등 저장이 안 되는 환경이면 조용히 무시하고 진행
+    }
     state = 'GAMEOVER_SLOWDOWN';
     gameOverExpandProgress = 0; 
 }
@@ -235,12 +322,12 @@ function clearBarStates(bar) {
     bar.pendingTrigger = false;
 }
 
-// [신규] 점수 기반 난이도 단계 계산
+// 점수 기반 난이도 단계 계산
 function getDifficultyTier() {
     return Math.floor(score / TIER_SCORE_STEP);
 }
 
-// [신규] 난이도가 오를수록 막대 폭(= 실제 탭 판정 범위)이 점점 좁아지도록 부드럽게 갱신
+// 난이도가 오를수록 막대 폭(= 실제 탭 판정 범위)이 점점 좁아지도록 부드럽게 갱신
 function updateDifficultyParams() {
     let widthMultiplier = max(0.55, 1 - getDifficultyTier() * 0.08);
     let targetWidth = barWidth * widthMultiplier;
@@ -248,11 +335,9 @@ function updateDifficultyParams() {
 }
 
 function randomizeBars() {
-    // [수정] 점수에 따라 패턴을 뽑음
     let bars = [bar1, bar2];
     let prevHollow = bars.map(b => b.isHollow);
 
-    // [신규] 난이도가 오를수록 "여러 막대를 연속으로 정확히 탭해야 하는" 패턴이 더 자주 등장
     let multiHollowChance = min(0.5, 0.12 + getDifficultyTier() * 0.04);
 
     if (random() < multiHollowChance) {
@@ -274,16 +359,14 @@ function updateBoxY() {
     let rad = (boxX / W) * 2 * PI;
     let idealY = baseline - waveDirection * amplitude * cos(rad);
     
-    yOffset *= 0.7;
+    yOffset *= Math.pow(0.7, dt); // 프레임 시간에 비례해 감쇠하도록 보정
     if (abs(yOffset) < 0.1) yOffset = 0;
     
     boxY = idealY + yOffset;
 }
 
-// [핵심 변경] 깜빡임 원천 차단을 위한 다중 파동(Ripple) 렌더링 시스템
+// 깜빡임 원천 차단을 위한 다중 파동(Ripple) 렌더링 시스템
 function renderBackgroundAndGrid() {
-    // [수정] 카메라가 박스를 따라 원래 캔버스 범위 밖으로 이동/확대돼도
-    // 절대 빈틈이 보이지 않도록 충분히 큰 사각형으로 배경을 채움 + 페이지(body) 배경색도 항상 동기화
     let bgMargin = W * 2;
     document.body.style.backgroundColor = baseBgColor.toString();
 
@@ -312,8 +395,8 @@ function renderBackgroundAndGrid() {
     for (let i = 0; i < ripples.length; i++) {
         let r = ripples[i];
         
-        // [요청] 새로운 파동 속도 및 모션 커브 적용 (cubic-bezier(.04,.53,.5,.95))
-        r.progress += 0.018; 
+        // [수정] 새로운 파동 속도 조절 (더 느리고 부드럽게)
+        r.progress += 0.009 * dt; 
         let easedT = getEasing(r.progress, 0.04, 0.53, 0.5, 0.95);
         let currentRadius = dist(0, 0, W, H) * easedT;
 
@@ -342,12 +425,12 @@ function renderBackgroundAndGrid() {
 
     // 4. 게임 오버 시 부드럽게 라이트모드 톤으로 회귀
     if (state === 'GAMEOVER_SLOWDOWN' || state === 'GAMEOVER_RETURN') {
-        baseBgColor = lerpColor(baseBgColor, colBgLight, 0.03);
-        baseGridAlpha = lerp(baseGridAlpha, 255, 0.03);
-        gradientAlpha = lerp(gradientAlpha, 0, 0.03);
+        baseBgColor = lerpColorDT(baseBgColor, colBgLight, 0.03);
+        baseGridAlpha = lerpDT(baseGridAlpha, 255, 0.03);
+        gradientAlpha = lerpDT(gradientAlpha, 0, 0.03);
         for (let r of ripples) {
-            r.targetBg = lerpColor(r.targetBg, colBgLight, 0.03);
-            r.targetGridAlpha = lerp(r.targetGridAlpha, 255, 0.03);
+            r.targetBg = lerpColorDT(r.targetBg, colBgLight, 0.03);
+            r.targetGridAlpha = lerpDT(r.targetGridAlpha, 255, 0.03);
         }
     }
 }
@@ -363,7 +446,6 @@ function drawSpecificGrid(alphaVal) {
     strokeWeight(1);
     
     let gridSize = min(W, H) * 0.085; 
-    // [신규] 화면 바깥까지 격자를 확장 (게임오버 시 카메라가 따라가며 줌/이동해도 빈 배경이 보이지 않게)
     let margin = W * 2;
     for (let x = -margin; x < W + margin; x += gridSize) line(x, -margin, x, H + margin);
     for (let y = -margin; y < H + margin; y += gridSize) line(-margin, y, W + margin, y);
@@ -373,14 +455,13 @@ function drawSpecificGrid(alphaVal) {
 // 깜빡임 방지를 위해 텍스트 색상도 부드럽게 페이드(Lerp) 처리
 function drawCenterText(str) {
     let targetTextColor = isDarkMode ? color(255, 255, 255, 45) : color(180, 180, 180);
-    currentTextColor = lerpColor(currentTextColor, targetTextColor, 0.1);
+    currentTextColor = lerpColorDT(currentTextColor, targetTextColor, 0.1);
 
     push();
     translate(W / 2, H / 2);
     scale(scorePopScale);
     textAlign(CENTER, CENTER);
     textSize(W * 0.65); 
-    // [신규] 텍스트 안쪽도 살짝 채워줌 (불투명도 20%)
     fill(red(currentTextColor), green(currentTextColor), blue(currentTextColor), 255 * 0.1);
     strokeWeight(2); 
     stroke(currentTextColor); 
@@ -388,34 +469,27 @@ function drawCenterText(str) {
     pop();
 }
 
-// [신규] 트렌디하고 감각적인 메인 타이틀 렌더링
+// 트렌디하고 감각적인 메인 타이틀 렌더링
 function drawTrendyTitle() {
-    // [신규] 폰트 크기와 줄간격을 모두 W(가로폭/vw) 기준으로만 계산.
-    // H에 의존하지 않으므로 화면의 vw(가로세로 비율)가 달라져도 줄간격 비율이 항상 동일함
     let titleSize = W * 0.2;
-    let lineGap = titleSize * 0.88; // "TAP2" -> "START" 줄간격
+    let lineGap = titleSize * 0.88; 
     
-    // "TAP2" / "START" - 왼쪽에서 오른쪽으로 슬라이드인, 나갈때 왼쪽으로 슬라이드아웃
     let titleSlideOffset = map(titleSlideProgress, -W * 0.5, 0, -W * 0.5, 0);
     push();
     translate(W * 0.05 + titleSlideOffset, H * 0.22);
     textAlign(LEFT, CENTER);
     
-    // "TAP2" (흰색, 아웃라인 없음)
     textSize(titleSize);
     fill(255, 255, 255, titleAlpha);
     noStroke();
     text("TAP2", 0, 0);
     
-    // "START" (흰색, 아웃라인 없음, 줄바꿈 - 간격 좁게)
     textSize(titleSize);
     fill(255, 255, 255, titleAlpha);
     noStroke();
     text("START", 0, lineGap);
     pop();
     
-    // [신규] BEST SCORE는 타이틀과 별도의(살짝 지연된) 슬라이드/알파 값을 사용해서
-    // 타이틀이 먼저 움직이고 BEST SCORE가 살짝 나중에 따라오도록 함
     if (bestScore > 0) {
         let bestScoreSlideOffset = map(bestScoreSlideProgress, -W * 0.5, 0, -W * 0.5, 0);
         push();
@@ -438,8 +512,11 @@ function draw() {
         return;
     }
 
-    // [신규] 카메라 트랜스폼 적용 시작
-    // camX, camY 지점이 화면 정중앙에 오도록 이동 -> 회전(틸트) -> 확대(줌)
+    // 프레임 시간 보정 계수 계산
+    dt = deltaTime / (1000 / 60);
+    dt = constrain(dt, 0.0001, 3); 
+
+    // 카메라 트랜스폼 적용 시작
     push();
     translate(W / 2, H / 2);
     rotate(camTilt);
@@ -453,33 +530,35 @@ function draw() {
         boxAngle = 0;
         updateBoxY();
 
-        // 카메라는 항상 원점(중앙/줌1/기울기0) 고정
         camX = W / 2;
         camY = H / 2;
         camZoom = 1;
         camTilt = 0;
         
-        drawCenterText(score); // 거대한 배경 숫자 0
-        gradientAlpha = lerp(gradientAlpha, 255, 0.08);
-        titleSlideProgress = lerp(titleSlideProgress, 0, 0.08);
-        titleAlpha = lerp(titleAlpha, 255, 0.08);
-        // [신규] BEST SCORE는 타이틀(TAP2/START)의 움직임을 살짝 늦게 뒤따라감
-        bestScoreSlideProgress = lerp(bestScoreSlideProgress, titleSlideProgress, 0.1);
-        bestScoreAlpha = lerp(bestScoreAlpha, titleAlpha, 0.1);
-        spinSpeed = lerp(spinSpeed, 0, 0.1);
-        scorePopScale = lerp(scorePopScale, 1, 0.1);
+        drawCenterText(score); 
+        gradientAlpha = lerpDT(gradientAlpha, 255, 0.08);
+        titleSlideProgress = lerpDT(titleSlideProgress, 0, 0.08);
+        titleAlpha = lerpDT(titleAlpha, 255, 0.08);
+        bestScoreSlideProgress = lerpDT(bestScoreSlideProgress, titleSlideProgress, 0.1);
+        bestScoreAlpha = lerpDT(bestScoreAlpha, titleAlpha, 0.1);
+        spinSpeed = lerpDT(spinSpeed, 0, 0.1);
+        scorePopScale = lerpDT(scorePopScale, 1, 0.1);
+
+        // [수정] 타이틀에서는 버튼이 원래 위치로 스르륵 올라옵니다.
+        howToPlayYOffset = lerpDT(howToPlayYOffset, 0, 0.08);
         
     } else if (state === 'PLAY') {
-        gradientAlpha = lerp(gradientAlpha, 0, 0.05);
-        titleSlideProgress = lerp(titleSlideProgress, -W * 0.5, 0.08);
-        titleAlpha = lerp(titleAlpha, 0, 0.08);
-        // [신규] BEST SCORE는 타이틀의 움직임을 살짝 늦게 뒤따라감
-        bestScoreSlideProgress = lerp(bestScoreSlideProgress, titleSlideProgress, 0.1);
-        bestScoreAlpha = lerp(bestScoreAlpha, titleAlpha, 0.1);
-        spinSpeed = lerp(spinSpeed, 0, 0.05);
-        scorePopScale = lerp(scorePopScale, 1, 0.1);
+        gradientAlpha = lerpDT(gradientAlpha, 0, 0.05);
+        titleSlideProgress = lerpDT(titleSlideProgress, -W * 0.5, 0.08);
+        titleAlpha = lerpDT(titleAlpha, 0, 0.08);
+        bestScoreSlideProgress = lerpDT(bestScoreSlideProgress, titleSlideProgress, 0.1);
+        bestScoreAlpha = lerpDT(bestScoreAlpha, titleAlpha, 0.1);
+        spinSpeed = lerpDT(spinSpeed, 0, 0.05);
+        scorePopScale = lerpDT(scorePopScale, 1, 0.1);
 
-        // 카메라는 항상 원점(중앙/줌1/기울기0) 고정
+        // [수정] 게임 시작 시 버튼이 화면 아래로 숨습니다.
+        howToPlayYOffset = lerpDT(howToPlayYOffset, H * 0.2, 0.08);
+
         camX = W / 2;
         camY = H / 2;
         camZoom = 1;
@@ -489,8 +568,8 @@ function draw() {
         currentSpeed = baseSpeedX * speedMultiplier;
 
         let prevX = boxX;
-        boxX += currentSpeed;
-        boxAngle += currentSpeed * 0.01 + spinSpeed;
+        boxX += currentSpeed * dt; 
+        boxAngle += (currentSpeed * 0.01 + spinSpeed) * dt; 
 
         checkBufferedTrigger(bar1, prevX, boxX);
         checkBufferedTrigger(bar2, prevX, boxX);
@@ -507,26 +586,64 @@ function draw() {
         updateBoxY();
         drawCenterText(score);
         
+    } else if (state === 'TUTORIAL') {
+        camX = W / 2;
+        camY = H / 2;
+        camZoom = 1;
+        camTilt = 0;
+
+        gradientAlpha = lerpDT(gradientAlpha, 0, 0.08);
+        titleSlideProgress = lerpDT(titleSlideProgress, -W * 0.5, 0.08);
+        titleAlpha = lerpDT(titleAlpha, 0, 0.08);
+        bestScoreSlideProgress = lerpDT(bestScoreSlideProgress, titleSlideProgress, 0.1);
+        bestScoreAlpha = lerpDT(bestScoreAlpha, titleAlpha, 0.1);
+
+        // [수정] 튜토리얼 진행 중에도 버튼을 숨깁니다.
+        howToPlayYOffset = lerpDT(howToPlayYOffset, H * 0.2, 0.08);
+
+        if (tutorialStep === 2) {
+            let prevX = boxX;
+            boxX += currentSpeed * dt;
+            boxAngle += (currentSpeed * 0.01 + spinSpeed) * dt;
+            spinSpeed = lerpDT(spinSpeed, 0, 0.1);
+
+            checkTutorialBufferedTrigger(bar1, prevX, boxX);
+            checkTutorialBufferedTrigger(bar2, prevX, boxX);
+            checkTutorialMiss(bar1, prevX, boxX);
+            checkTutorialMiss(bar2, prevX, boxX);
+
+            if (boxX >= W) {
+                boxX -= W;
+                clearBarStates(bar1);
+                clearBarStates(bar2);
+                randomizeBars();
+            }
+            updateBoxY();
+            drawCenterText(tutorialPracticeHits);
+        } else {
+            boxX = bar1.x;
+            boxAngle = 0;
+            updateBoxY();
+        }
+
+        drawTutorialOverlay();
+
     } else if (state === 'GAMEOVER_SLOWDOWN') {
-        gameOverExpandProgress += 0.025; 
+        gameOverExpandProgress += 0.025 * dt; 
         if (gameOverExpandProgress > 1) gameOverExpandProgress = 1;
         
         let easedT = getEasing(gameOverExpandProgress, 0, 0.03, 0, 1.01);
         currentBoxSize = boxSize + (boxSize * 3 - boxSize) * easedT; 
         boxHollowLerp = easedT; 
 
-        currentSpeed *= 0.94; 
-        boxX += currentSpeed;
-        boxAngle += currentSpeed * 0.01;
-        
-        // [변경] 플레이어가 죽은 상태에서는 우측 -> 좌측으로 워프하는 로직을 끔
-        // (카메라가 따라가며 박스가 화면 밖으로 자연스럽게 빠져나가게 함)
+        currentSpeed *= Math.pow(0.94, dt); 
+        boxX += currentSpeed * dt; 
+        boxAngle += currentSpeed * 0.01 * dt; 
         
         updateBoxY();
 
-        // [신규] 카메라가 플레이어(상자)를 따라가며 확대 + 기울어짐
-        camX = lerp(camX, boxX, 0.15);
-        camY = lerp(camY, boxY, 0.15);
+        camX = lerpDT(camX, boxX, 0.15);
+        camY = lerpDT(camY, boxY, 0.15);
         camZoom = lerp(1, CAM_ZOOM_MAX, boxHollowLerp);
         camTilt = lerp(0, CAM_TILT_MAX, boxHollowLerp);
 
@@ -535,7 +652,7 @@ function draw() {
         if (abs(currentSpeed) < 0.2) {
             currentSpeed = 0;
             state = 'GAMEOVER_RETURN';
-            isDarkMode = false; // 리와인드 시 강제로 라이트모드 복귀 시작
+            isDarkMode = false; 
             
             returnProgress = 0;
             returnStartX = boxX;
@@ -543,7 +660,6 @@ function draw() {
             returnStartAngle = boxAngle;
             returnStartSize = currentBoxSize;
 
-            // [신규] 카메라 복귀 애니메이션의 시작값 캡처
             camReturnStartX = camX;
             camReturnStartY = camY;
             camReturnStartZoom = camZoom;
@@ -551,11 +667,11 @@ function draw() {
         }
 
     } else if (state === 'GAMEOVER_RETURN') {
-        returnProgress += 0.015; 
+        returnProgress += 0.015 * dt; 
         if (returnProgress > 1) returnProgress = 1;
         
-        titleSlideProgress = lerp(titleSlideProgress, 0, 0.08);
-        titleAlpha = lerp(titleAlpha, 255, 0.08);
+        titleSlideProgress = lerpDT(titleSlideProgress, 0, 0.08);
+        titleAlpha = lerpDT(titleAlpha, 255, 0.08);
         
         let easedT = getEasing(returnProgress, 0.79, 0.01, 0.25, 1);
 
@@ -569,8 +685,6 @@ function draw() {
         currentBoxSize = lerp(returnStartSize, boxSize, easedT);
         boxHollowLerp = lerp(1, 0, easedT); 
 
-        // [신규] 플레이어가 원점으로 돌아가는 것과 동일한 이징으로
-        // 카메라도 원점(중앙 / 줌1 / 기울기0)으로 함께 복귀
         camX = lerp(camReturnStartX, W / 2, easedT);
         camY = lerp(camReturnStartY, H / 2, easedT);
         camZoom = lerp(camReturnStartZoom, 1, easedT);
@@ -583,17 +697,16 @@ function draw() {
         }
     }
 
-    // [신규] 타이틀(TAP2 START / BEST SCORE)을 TITLE <-> PLAY 전환 동안
-    // 계속 그려줘서 즉시 사라지지 않고 왼쪽으로 슬라이드+페이드되며 자연스럽게 사라지게 함
     if ((state === 'TITLE' || state === 'PLAY') && (titleAlpha > 1 || bestScoreAlpha > 1)) {
         drawTrendyTitle();
+        drawHowToPlayButton(titleAlpha); 
     }
 
     drawBars();
     drawBox();
 
     pop();
-    // [신규] 카메라 트랜스폼 적용 끝
+    // 카메라 트랜스폼 적용 끝
 }
 
 function checkBufferedTrigger(bar, pX, cX) {
@@ -614,7 +727,7 @@ function checkMiss(bar, pX, cX) {
 
 function executeSuccess(bar) {
     score++;
-successFx();
+    successFx();
     scorePopScale = 1.3;
     
     let rad = (boxX / W) * 2 * PI;
@@ -631,7 +744,6 @@ successFx();
 
     isDarkMode = !isDarkMode;
     
-    // [신규] 다중 파동(Ripple) 배열에 새로운 애니메이션 객체 추가
     ripples.push({
         x: bar.x,
         y: H / 2,
@@ -648,8 +760,7 @@ function drawBars() {
 }
 
 function drawBar(bar) {
-    // [신규] 막대 교체 팝 이펙트를 매 프레임 원래 상태로 부드럽게 복원
-    bar.popScale = lerp(bar.popScale, 1, 0.2);
+    bar.popScale = lerpDT(bar.popScale, 1, 0.2);
 
     let mainColor = isDarkMode ? colBarDark : colBarLight;
     
@@ -668,8 +779,7 @@ function drawBar(bar) {
 
 function drawBox() {
     drawSingleBox(boxX, boxY);
-    // [변경] 화면 양끝에 박스를 복제해서 보여주는 건 좌우 워프가 실제로 일어나는 PLAY 상태에서만 필요함
-    if (state === 'PLAY') {
+    if (state === 'PLAY' || (state === 'TUTORIAL' && tutorialStep === 2)) {
         if (boxX > W - currentBoxSize) drawSingleBox(boxX - W, boxY);
         if (boxX < currentBoxSize) drawSingleBox(boxX + W, boxY);
     }
@@ -693,16 +803,21 @@ function drawSingleBox(x, y) {
     pop();
 }
 
-function mousePressed() {
+function onTap(clientX, clientY) {
     if (!isSupported) return;
 
     if (state === 'TITLE') {
+        if (isInsideHowToPlayButton(clientX, clientY)) {
+            startTutorial(); 
+            return;
+        }
         state = 'PLAY';
     } else if (state === 'PLAY') {
         let hitBar = null;
-        
-        if (abs(boxX - bar1.x) <= barWidth / 2) hitBar = bar1;
-        else if (abs(boxX - bar2.x) <= barWidth / 2) hitBar = bar2;
+        let offset = 0;
+
+        if (abs(boxX - bar1.x) <= barWidth / 2) { hitBar = bar1; offset = boxX - bar1.x; }
+        else if (abs(boxX - bar2.x) <= barWidth / 2) { hitBar = bar2; offset = boxX - bar2.x; }
 
         if (hitBar) {
             if (hitBar.isHollow && !hitBar.cleared) {
@@ -714,8 +829,180 @@ function mousePressed() {
         } else {
             triggerGameOver(); 
         }
-    } 
+    } else if (state === 'TUTORIAL') {
+        handleTutorialTap(); 
+    }
 }
+
+// ===================== HOW TO PLAY 버튼 + 튜토리얼 =====================
+
+function getHowToPlayButtonRect() {
+    let btnW = W * 0.32;
+    let btnH = H * 0.042;
+    return {
+        x: W / 2 - btnW / 2,
+        y: H * 0.86 + howToPlayYOffset, // [수정] 애니메이션 오프셋 적용
+        w: btnW,
+        h: btnH
+    };
+}
+
+function isInsideHowToPlayButton(px, py) {
+    let r = getHowToPlayButtonRect();
+    return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+}
+
+function drawHowToPlayButton(alpha) {
+    if (alpha <= 1) return;
+    let r = getHowToPlayButtonRect();
+    push();
+    rectMode(CORNER);
+    fill(color('#f5f5f5'), alpha);
+    strokeWeight(1.5);
+    stroke(color('#767676'), alpha);
+    rect(r.x, r.y, r.w, r.h, r.h / 1);
+    noStroke();
+    fill(color('#767676'), alpha);
+    textAlign(CENTER, CENTER);
+    textSize(r.h * 0.32);
+    text("HOW 2 PLAY", r.x + r.w / 2, r.y + r.h / 2 + 1);
+    pop();
+}
+
+function startTutorial() {
+    state = 'TUTORIAL';
+    tutorialStep = 0;
+    tutorialPracticeHits = 0;
+    tutorialFeedbackText = '';
+    tutorialFeedbackAlpha = 0;
+
+    bar1.isHollow = false; 
+    bar2.isHollow = true;  
+    clearBarStates(bar1);
+    clearBarStates(bar2);
+    bar1.cleared = true;
+    bar1.popScale = 1;
+    bar2.popScale = 1;
+
+    waveDirection = -1;
+    yOffset = 0;
+    boxAngle = 0;
+    currentSpeed = 0;
+    boxX = bar1.x;
+    updateBoxY();
+}
+
+function handleTutorialTap() {
+    if (tutorialStep === 0) {
+        tutorialStep = 1;
+    } else if (tutorialStep === 1) {
+        tutorialStep = 2;
+        currentSpeed = baseSpeedX * 0.6; 
+    } else if (tutorialStep === 2) {
+        let hitBar = null;
+        let offset = 0;
+        if (abs(boxX - bar1.x) <= barWidth / 2) { hitBar = bar1; offset = boxX - bar1.x; }
+        else if (abs(boxX - bar2.x) <= barWidth / 2) { hitBar = bar2; offset = boxX - bar2.x; }
+
+        if (hitBar && hitBar.isHollow && !hitBar.cleared) {
+            if (boxX < hitBar.x) hitBar.pendingTrigger = true;
+            else executeTutorialSuccess(hitBar);
+        } else {
+            tutorialFailPractice();
+        }
+    } else if (tutorialStep === 3) {
+        resetGame(); 
+    }
+}
+
+function checkTutorialBufferedTrigger(bar, pX, cX) {
+    if (bar.pendingTrigger && pX <= bar.x && cX >= bar.x) {
+        executeTutorialSuccess(bar);
+        bar.pendingTrigger = false;
+    }
+}
+
+function checkTutorialMiss(bar, pX, cX) {
+    let rightEdge = bar.x + barWidth / 2;
+    if (pX <= rightEdge && cX > rightEdge) {
+        if (bar.isHollow && !bar.cleared) {
+            tutorialFailPractice();
+        }
+    }
+}
+
+function executeTutorialSuccess(bar) {
+    executeSuccess(bar); 
+    tutorialPracticeHits++;
+    if (tutorialPracticeHits >= TUTORIAL_PRACTICE_TARGET) {
+        tutorialStep = 3;
+        currentSpeed = 0;
+    }
+}
+
+function tutorialFailPractice() {
+    failFx();
+    tutorialFeedbackText = 'TRY AGAIN!';
+    tutorialFeedbackAlpha = 255;
+
+    clearBarStates(bar1);
+    clearBarStates(bar2);
+    bar1.isHollow = false;
+    bar2.isHollow = true;
+    bar1.cleared = true;
+    boxX = bar1.x;
+    updateBoxY();
+    currentSpeed = baseSpeedX * 0.6;
+}
+
+function drawTutorialOverlay() {
+    tutorialFeedbackAlpha = lerpDT(tutorialFeedbackAlpha, 0, 0.04);
+
+    push();
+    textAlign(CENTER, CENTER);
+    noStroke();
+    let mainTextColor = isDarkMode ? color(255) : color(30);
+
+    if (tutorialStep === 0) {
+        fill(mainTextColor);
+        textSize(W * 0.05);
+        text("You can still pass the filled bar as is", W / 2, H * 0.32);
+        textSize(W * 0.038);
+        fill(230, 63, 49);
+        text("Tap and it's game over! Don't touch it", W / 2, H * 0.32 + W * 0.08);
+        fill(mainTextColor);
+        textSize(W * 0.033);
+        text("TAP 2 PRACTICE →", W / 2, H * 0.882);
+    } else if (tutorialStep === 1) {
+        fill(mainTextColor);
+        textSize(W * 0.05);
+        text("Tap the moment \n the box touches the empty bar", W / 2, H * 0.32);
+        textSize(W * 0.038);
+        fill(60, 160, 110);
+        text("exactly when the box touches the empty bar!", W / 2, H * 0.33 + W * 0.08);
+        fill(mainTextColor);
+        textSize(W * 0.033);
+        text("TAP 2 PRACTICE →", W / 2, H * 0.882);
+    } else if (tutorialStep === 2) {
+        fill(mainTextColor);
+        textSize(W * 0.038);
+        text("Practice on your own (" + tutorialPracticeHits + " / " + TUTORIAL_PRACTICE_TARGET + ")", W / 2, H * 0.16);
+
+        if (tutorialFeedbackAlpha > 1) {
+            fill(230, 63, 49, tutorialFeedbackAlpha);
+            textSize(W * 0.042);
+            text(tutorialFeedbackText, W / 2, H * 0.32);
+        }
+    } else if (tutorialStep === 3) {
+        fill(mainTextColor);
+        textSize(W * 0.058);
+        text("Tutorial Complete!", W / 2, H * 0.32);
+        textSize(W * 0.035);
+        text("Tap 2 start →", W / 2, H * 0.92);
+    }
+    pop();
+}
+
 </script>
 </body>
 </html>
